@@ -1,0 +1,8 @@
+names:
+  0: car
+  1: pedestrian
+  2: cyclist
+nc: 3
+path: C:\Users\apple\Desktop\autonomous_cv_pipeline\phase4_carla\data_collection\carla_dataset
+train: images
+val: images

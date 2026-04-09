@@ -1,0 +1,1009 @@
+File written successfully
+=====================================================
+FILE 2: 03_nuscenes_multicamera_bev.ipynb
+================================================================================
+
+
+[CODE CELL 1]
+# Cell 1 — 한글 폰트 설정 + 전체 임포트
+import matplotlib
+matplotlib.rcParams['font.family'] = 'Malgun Gothic'
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+import os, json, time
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+
+try:
+    from PIL import Image
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+    print('PIL 없음: pip install Pillow')
+
+print(f'PyTorch: {torch.__version__}')
+print(f'CUDA 사용 가능: {torch.cuda.is_available()}')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'사용 디바이스: {DEVICE}')
+--------------------------------------------------------------------------------
+
+[CODE CELL 2]
+# Cell 3 — nuScenes 데이터 로딩 (또는 합성 데이터 대체)
+
+NUSCENES_ROOT = Path('data/nuscenes')  # nuScenes mini 데이터셋 루트
+
+# nuScenes 6개 카메라
+CAMERAS = [
+    'CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
+    'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'
+]
+
+def load_nuscenes_sample(nusc, sample_token: str) -> Dict:
+    """nuScenes API를 통해 하나의 샘플(6개 카메라 + 캘리브) 로드"""
+    from nuscenes.nuscenes import NuScenes
+    sample = nusc.get('sample', sample_token)
+    data = {}
+
+    for cam in CAMERAS:
+        cam_token = sample['data'][cam]
+        cam_data = nusc.get('sample_data', cam_token)
+        cs = nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
+
+        # 카메라 내부 파라미터
+        K = np.array(cs['camera_intrinsic'])  # (3, 3)
+
+        # 카메라 → 차량 좌표계 변환
+        T_cam2ego = np.eye(4)
+        T_cam2ego[:3, :3] = np.array(cs['rotation']).reshape(3, 3)
+        T_cam2ego[:3,  3] = cs['translation']
+
+        img_path = NUSCENES_ROOT / cam_data['filename']
+        data[cam] = {'K': K, 'T_cam2ego': T_cam2ego, 'img_path': img_path}
+
+    return data
+
+
+def generate_synthetic_multicam_data(n_cameras=6, img_h=256, img_w=448) -> Dict:
+    """
+    합성 멀티카메라 데이터 생성
+    실제 차량에 설치된 카메라 배치를 시뮬레이션
+    """
+    np.random.seed(42)
+    angles = np.linspace(0, 2*np.pi, n_cameras, endpoint=False)   # 360° 균등 배치
+
+    # 실제 nuScenes 카메라 내부 파라미터 근사
+    fx, fy = 1266.0, 1266.0
+    cx, cy = img_w / 2, img_h / 2
+    K = np.array([[fx, 0, cx],
+                  [0, fy, cy],
+                  [0,  0,  1]], dtype=np.float32)
+
+    cameras = {}
+    for i, cam_name in enumerate(CAMERAS):
+        # 카메라 위치 (차량 중심 기준, 반지름 1.5m)
+        cam_x = 1.5 * np.cos(angles[i])
+        cam_y = 1.5 * np.sin(angles[i])
+        cam_z = 1.6  # 지면에서 1.6m 높이
+
+        # 카메라가 바깥을 향하도록 회전
+        yaw = angles[i]
+        R = np.array([
+            [np.cos(yaw), -np.sin(yaw), 0],
+            [np.sin(yaw),  np.cos(yaw), 0],
+            [0,            0,           1]
+        ], dtype=np.float32)
+
+        T_cam2ego = np.eye(4, dtype=np.float32)
+        T_cam2ego[:3, :3] = R
+        T_cam2ego[:3,  3] = [cam_x, cam_y, cam_z]
+
+        # 합성 이미지 (실제에서는 카메라 이미지 로드)
+        img = np.random.randint(50, 200, (img_h, img_w, 3), dtype=np.uint8)
+        # 하늘 영역 (위쪽 절반: 파란색 계열)
+        img[:img_h//2, :, 0] = np.random.randint(100, 180, (img_h//2, img_w))
+        img[:img_h//2, :, 1] = np.random.randint(150, 220, (img_h//2, img_w))
+        img[:img_h//2, :, 2] = np.random.randint(180, 255, (img_h//2, img_w))
+        # 도로 영역 (아래쪽 절반: 회색 계열)
+        img[img_h//2:, :, :] = np.random.randint(80, 140, (img_h//2, img_w, 3))
+
+        cameras[cam_name] = {
+            'K': K.copy(),
+            'T_cam2ego': T_cam2ego,
+            'image': img,
+            'angle_deg': np.degrees(yaw)
+        }
+
+    return cameras
+
+
+# 데이터 로드
+if NUSCENES_ROOT.exists():
+    try:
+        from nuscenes.nuscenes import NuScenes
+        nusc = NuScenes(version='v1.0-mini', dataroot=str(NUSCENES_ROOT), verbose=False)
+        sample_tokens = [s['token'] for s in nusc.sample[:5]]
+        cam_data = load_nuscenes_sample(nusc, sample_tokens[0])
+        USE_NUSCENES = True
+        print(f'nuScenes mini 로드 완료: {len(nusc.sample)}개 샘플')
+    except Exception as e:
+        print(f'nuScenes 로드 실패: {e} → 합성 데이터 사용')
+        cam_data = generate_synthetic_multicam_data()
+        USE_NUSCENES = False
+else:
+    print('nuScenes 없음 → 합성 데이터 사용')
+    print('다운로드: https://www.nuscenes.org/nuscenes#download (mini, ~4GB)')
+    cam_data = generate_synthetic_multicam_data()
+    USE_NUSCENES = False
+
+print(f'\n로드된 카메라 수: {len(cam_data)}')
+for cam_name, info in cam_data.items():
+    print(f'  {cam_name}: K shape={info["K"].shape}, '
+          f'T_cam2ego shape={info["T_cam2ego"].shape}')
+--------------------------------------------------------------------------------
+
+[CODE CELL 3]
+# Cell 4 — 6개 카메라 360° 배치 시각화
+
+fig = plt.figure(figsize=(15, 8))
+
+# 서브플롯 1: 카메라 배치도 (BEV)
+ax_bev = fig.add_subplot(2, 4, 4)
+ax_bev.set_title('차량 + 카메라 배치 (BEV)', fontsize=10)
+
+for i, (cam_name, info) in enumerate(cam_data.items()):
+    T = info['T_cam2ego']
+    cx, cy = T[0, 3], T[1, 3]
+
+    # 카메라 방향 (전방 벡터)
+    fwd = T[:3, :3] @ np.array([0, 0, 1])  # 카메라 z축 = 전방
+
+    colors = ['red', 'orange', 'gold', 'blue', 'navy', 'purple']
+    ax_bev.scatter(cx, cy, c=colors[i], s=80, zorder=3)
+    ax_bev.arrow(cx, cy, fwd[0]*0.8, fwd[1]*0.8,
+                 head_width=0.1, color=colors[i], alpha=0.8)
+    ax_bev.text(cx*1.3, cy*1.3, cam_name.replace('CAM_', ''),
+                fontsize=7, ha='center', color=colors[i])
+
+# 차량 표시
+car = patches.FancyBboxPatch((-1, -0.5), 2, 1,
+    boxstyle='round,pad=0.1', facecolor='lightgray', edgecolor='black', linewidth=2)
+ax_bev.add_patch(car)
+ax_bev.set_xlim(-3, 3)
+ax_bev.set_ylim(-3, 3)
+ax_bev.set_aspect('equal')
+ax_bev.set_xlabel('X (m)')
+ax_bev.set_ylabel('Y (m)')
+ax_bev.grid(alpha=0.3)
+
+# 서브플롯 2~7: 각 카메라 이미지
+subplot_positions = [1, 2, 3, 5, 6, 7]
+for i, (cam_name, info) in enumerate(cam_data.items()):
+    ax = fig.add_subplot(2, 4, subplot_positions[i])
+    if 'image' in info:
+        ax.imshow(info['image'])
+    else:
+        ax.text(0.5, 0.5, '이미지\n없음', ha='center', va='center',
+                transform=ax.transAxes, fontsize=12)
+    ax.set_title(cam_name.replace('CAM_', ''), fontsize=9)
+    ax.axis('off')
+
+plt.suptitle('nuScenes 멀티카메라 360° 서라운드뷰', fontsize=12, fontweight='bold')
+plt.tight_layout()
+plt.show()
+--------------------------------------------------------------------------------
+
+[CODE CELL 4]
+# Cell 5 — LSS 핵심 설정값 + 좌표 변환 준비
+
+# ── LSS 하이퍼파라미터 ─────────────────────────────
+# 깊이 빈 설정 (논문: 4m ~ 45m, 1m 간격)
+D_MIN, D_MAX, D_STEP = 4.0, 45.0, 1.0
+DEPTH_BINS = np.arange(D_MIN, D_MAX + D_STEP, D_STEP)  # (D,)
+N_DEPTHS = len(DEPTH_BINS)   # 42개
+
+# 이미지 크기 (다운샘플 후)
+IMG_H, IMG_W = 128, 352   # 백본 후 크기 (원본 1/8 다운샘플)
+ORIG_H, ORIG_W = 900, 1600  # nuScenes 원본 (합성에서는 256×448)
+
+# BEV 격자 설정
+BEV_X_RANGE = (-50, 50)   # 전후 100m
+BEV_Y_RANGE = (-50, 50)   # 좌우 100m
+BEV_RESOLUTION = 0.5      # m/pixel
+BEV_W = int((BEV_X_RANGE[1] - BEV_X_RANGE[0]) / BEV_RESOLUTION)  # 200
+BEV_H = int((BEV_Y_RANGE[1] - BEV_Y_RANGE[0]) / BEV_RESOLUTION)  # 200
+
+print(f'깊이 빈: {N_DEPTHS}개 ({D_MIN}m ~ {D_MAX}m, {D_STEP}m 간격)')
+print(f'이미지 크기 (백본 후): {IMG_H} × {IMG_W}')
+print(f'BEV 격자: {BEV_H} × {BEV_W} ({BEV_RESOLUTION}m/pixel)')
+print(f'BEV 범위: x=[{BEV_X_RANGE[0]}, {BEV_X_RANGE[1]}]m, '
+      f'y=[{BEV_Y_RANGE[0]}, {BEV_Y_RANGE[1]}]m')
+print(f'\n전체 3D 포인트 수 (카메라당): {IMG_H}×{IMG_W}×{N_DEPTHS} = {IMG_H*IMG_W*N_DEPTHS:,}')
+print(f'6개 카메라 합산: {6*IMG_H*IMG_W*N_DEPTHS:,}개')
+
+
+def create_frustum(img_h=IMG_H, img_w=IMG_W, depths=DEPTH_BINS) -> torch.Tensor:
+    """
+    카메라 절두체(frustum) 격자 생성
+    각 픽셀-깊이 조합의 3D 좌표를 미리 계산
+
+    반환: (D, H, W, 3) — 카메라 좌표계에서의 3D 점
+    """
+    D = len(depths)
+
+    # 이미지 격자 생성
+    xs = torch.linspace(0, img_w - 1, img_w)   # (W,)
+    ys = torch.linspace(0, img_h - 1, img_h)   # (H,)
+    ds = torch.tensor(depths, dtype=torch.float32)  # (D,)
+
+    # 3D 격자: (D, H, W)
+    d_grid, y_grid, x_grid = torch.meshgrid(ds, ys, xs, indexing='ij')
+
+    # 정규화된 카메라 좌표 (내부 파라미터는 Lift 시 적용)
+    # 여기선 픽셀 좌표 + 깊이를 저장
+    frustum = torch.stack([x_grid, y_grid, d_grid], dim=-1)  # (D, H, W, 3)
+    return frustum
+
+
+frustum = create_frustum()
+print(f'\n절두체 shape: {frustum.shape}')  # (42, 128, 352, 3)
+print(f'절두체 메모리: {frustum.nbytes/1e6:.1f}MB')
+--------------------------------------------------------------------------------
+
+[CODE CELL 5]
+# Cell 6 — Lift 단계: 깊이 예측 네트워크 + 3D 포인트 생성
+
+class DepthPredictionNet(nn.Module):
+    """
+    이미지 특징 → 깊이 분포 + 컨텍스트 특징 예측
+
+    구조 (간소화 EfficientNet-like):
+    - Encoder: 이미지 → (C_feat, H/8, W/8)
+    - Depth head: (C_feat, H/8, W/8) → (D, H/8, W/8) (소프트맥스 확률)
+    - Context head: (C_feat, H/8, W/8) → (C_ctx, H/8, W/8)
+
+    논문 핵심: 깊이와 컨텍스트를 **독립적으로** 예측 후 외적
+    """
+    def __init__(self, in_channels=3, feat_channels=64,
+                 n_depths=N_DEPTHS, ctx_channels=64):
+        super().__init__()
+        self.n_depths = n_depths
+        self.ctx_ch = ctx_channels
+
+        # 간소화 인코더 (실제 구현에서는 EfficientNet-B0 사용)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, feat_channels, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(feat_channels), nn.ReLU(inplace=True),
+        )  # 3단계 다운샘플 → H/8, W/8
+
+        # 깊이 예측 헤드
+        self.depth_head = nn.Conv2d(feat_channels, n_depths, 1)
+
+        # 컨텍스트 특징 헤드
+        self.ctx_head = nn.Sequential(
+            nn.Conv2d(feat_channels, feat_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(feat_channels), nn.ReLU(inplace=True),
+            nn.Conv2d(feat_channels, ctx_channels, 1)
+        )
+
+    def forward(self, img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            img: (B*N_cam, 3, H, W)
+        Returns:
+            depth: (B*N_cam, D, H/8, W/8)  — 소프트맥스 깊이 분포
+            ctx:   (B*N_cam, C, H/8, W/8)  — 컨텍스트 특징
+        """
+        feat = self.encoder(img)              # (B*N, C, h, w)
+        depth = self.depth_head(feat)          # (B*N, D, h, w)
+        depth = depth.softmax(dim=1)           # 확률 분포로 정규화
+        ctx   = self.ctx_head(feat)            # (B*N, C_ctx, h, w)
+        return depth, ctx
+
+
+class LiftOperation(nn.Module):
+    """
+    Lift: 2D 이미지 → 3D 포인트 구름
+
+    각 픽셀에 대해 D개의 깊이 후보 위치에 특징을 배치
+    포인트 특징 = 깊이 확률 × 컨텍스트 특징 (외적)
+    """
+    def __init__(self, depths=DEPTH_BINS, img_h=IMG_H, img_w=IMG_W):
+        super().__init__()
+        self.depths = torch.tensor(depths, dtype=torch.float32)  # (D,)
+        self.register_buffer('depth_vals', self.depths)
+
+    def forward(self, depth_prob: torch.Tensor,
+                ctx: torch.Tensor,
+                K: torch.Tensor,
+                T_cam2ego: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            depth_prob: (B, D, h, w)  — 소프트맥스 깊이 분포
+            ctx:        (B, C, h, w)  — 컨텍스트 특징
+            K:          (B, 3, 3)     — 카메라 내부 파라미터
+            T_cam2ego:  (B, 4, 4)     — 카메라→차량 변환 행렬
+
+        Returns:
+            points_ego: (B, D*h*w, 3)  — 차량 좌표계 3D 포인트
+            feats:      (B, D*h*w, C)  — 포인트별 가중 특징
+        """
+        B, D, h, w = depth_prob.shape
+        C = ctx.shape[1]
+
+        # 1. 픽셀 격자 생성 (h×w)
+        u = torch.linspace(0, w-1, w, device=ctx.device)  # (w,)
+        v = torch.linspace(0, h-1, h, device=ctx.device)  # (h,)
+        vv, uu = torch.meshgrid(v, u, indexing='ij')       # (h, w)
+
+        # 2. 내부 파라미터로 정규화 좌표 계산
+        # 이미지 크기 스케일 (백본 후 다운샘플 고려)
+        fx = K[:, 0, 0].view(B, 1, 1)   # (B, 1, 1)
+        fy = K[:, 1, 1].view(B, 1, 1)
+        cx = K[:, 0, 2].view(B, 1, 1)
+        cy = K[:, 1, 2].view(B, 1, 1)
+
+        # 스케일 팩터 (원본→다운샘플)
+        scale_x = w / ORIG_W
+        scale_y = h / ORIG_H
+
+        # 정규화된 방향 벡터 (단위 깊이)
+        # (u - cx*scale) / fx 등
+        x_norm = (uu.unsqueeze(0) - cx * scale_x) / (fx * scale_x)  # (B, h, w)
+        y_norm = (vv.unsqueeze(0) - cy * scale_y) / (fy * scale_y)
+
+        # 3. D개 깊이에서 3D 좌표 계산
+        d_vals = self.depth_vals.to(ctx.device)  # (D,)
+
+        # (B, D, h, w, 3) 3D 포인트 (카메라 좌표계)
+        x_3d = (x_norm.unsqueeze(1) * d_vals.view(1, D, 1, 1))
+        y_3d = (y_norm.unsqueeze(1) * d_vals.view(1, D, 1, 1))
+        z_3d = d_vals.view(1, D, 1, 1).expand(B, D, h, w)
+
+        pts_cam = torch.stack([x_3d, y_3d, z_3d,
+                               torch.ones_like(z_3d)], dim=-1)   # (B, D, h, w, 4)
+        pts_cam = pts_cam.view(B, D*h*w, 4)                       # (B, D*h*w, 4)
+
+        # 4. 카메라 → 차량 좌표계 변환
+        pts_ego = (T_cam2ego @ pts_cam.transpose(1, 2))           # (B, 4, D*h*w)
+        pts_ego = pts_ego.transpose(1, 2)[..., :3]                # (B, D*h*w, 3)
+
+        # 5. 포인트 특징 = 깊이 확률 × 컨텍스트 (외적)
+        # depth_prob: (B, D, h, w)
+        # ctx:        (B, C, h, w)
+        # → 각 픽셀에서 D개 깊이마다 컨텍스트 특징을 깊이 확률로 가중
+        depth_w = depth_prob.unsqueeze(2)         # (B, D, 1, h, w)
+        ctx_exp = ctx.unsqueeze(1)                # (B, 1, C, h, w)
+        point_feats = (depth_w * ctx_exp)         # (B, D, C, h, w)
+        point_feats = point_feats.permute(0, 1, 3, 4, 2)  # (B, D, h, w, C)
+        point_feats = point_feats.reshape(B, D*h*w, C)    # (B, D*h*w, C)
+
+        return pts_ego, point_feats
+
+
+# 동작 테스트
+net = DepthPredictionNet(in_channels=3, feat_channels=64,
+                          n_depths=N_DEPTHS, ctx_channels=64)
+lift_op = LiftOperation(depths=DEPTH_BINS)
+
+# 더미 이미지 (배치 1, 3채널, IMG_H*8 × IMG_W*8 → 인코더 후 IMG_H × IMG_W)
+dummy_img = torch.randn(1, 3, IMG_H * 8, IMG_W * 8)  # 원본 크기
+
+with torch.no_grad():
+    depth_prob, ctx = net(dummy_img)   # H/8, W/8로 자동 다운샘플
+
+print(f'깊이 분포 shape: {depth_prob.shape}')  # (1, 42, H/8, W/8)
+print(f'컨텍스트 shape: {ctx.shape}')           # (1, 64, H/8, W/8)
+print(f'깊이 분포 합 (≈1): {depth_prob[0,:,32,88].sum().item():.4f}')
+
+# 내부 파라미터 + 변환 행렬 (더미)
+K_dummy = torch.tensor([[[1266.0, 0, IMG_W*4],
+                          [0, 1266.0, IMG_H*4],
+                          [0, 0, 1]]], dtype=torch.float32)
+T_dummy = torch.eye(4).unsqueeze(0)
+
+h_feat, w_feat = depth_prob.shape[2], depth_prob.shape[3]
+
+with torch.no_grad():
+    pts_ego, pt_feats = lift_op(
+        depth_prob, ctx, K_dummy, T_dummy
+    )
+
+print(f'\n3D 포인트 shape: {pts_ego.shape}')    # (1, D*h*w, 3)
+print(f'포인트 특징 shape: {pt_feats.shape}')   # (1, D*h*w, 64)
+print(f'x 범위: [{pts_ego[0,:,0].min():.1f}, {pts_ego[0,:,0].max():.1f}]')
+print(f'z 범위: [{pts_ego[0,:,2].min():.1f}, {pts_ego[0,:,2].max():.1f}]')
+--------------------------------------------------------------------------------
+
+[CODE CELL 6]
+# Cell 7 — Splat 단계: 3D 포인트 → BEV 피처맵
+# Cumsum trick으로 효율적인 voxel pooling
+
+class SplatOperation(nn.Module):
+    """
+    Splat: 3D 포인트 구름 → BEV 피처맵
+
+    각 3D 포인트를 BEV 격자 셀에 할당 후 특징 합산
+
+    논문의 Cumsum trick:
+    1. 포인트들을 BEV 격자 인덱스로 정렬
+    2. cumsum → 구간별 합 → pooling
+    → GPU 병렬화 가능!
+    """
+    def __init__(self,
+                 bev_x_range=BEV_X_RANGE,
+                 bev_y_range=BEV_Y_RANGE,
+                 bev_resolution=BEV_RESOLUTION,
+                 z_range=(-10, 10)):
+        super().__init__()
+        self.x_range = bev_x_range
+        self.y_range = bev_y_range
+        self.res = bev_resolution
+        self.z_range = z_range
+        self.bev_w = int((bev_x_range[1] - bev_x_range[0]) / bev_resolution)
+        self.bev_h = int((bev_y_range[1] - bev_y_range[0]) / bev_resolution)
+
+    def forward(self, pts_ego: torch.Tensor,
+                pt_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pts_ego:  (B, N, 3)  — 차량 좌표계 3D 포인트
+            pt_feats: (B, N, C)  — 포인트 특징
+
+        Returns:
+            bev_feat: (B, C, H_bev, W_bev)  — BEV 피처맵
+        """
+        B, N, C = pt_feats.shape
+        bev_feat = torch.zeros(B, C, self.bev_h, self.bev_w,
+                               device=pt_feats.device, dtype=pt_feats.dtype)
+
+        for b in range(B):
+            pts = pts_ego[b]    # (N, 3): x, y, z
+            feat = pt_feats[b]  # (N, C)
+
+            # BEV 범위 + z 범위 필터링
+            valid = (
+                (pts[:, 0] >= self.x_range[0]) & (pts[:, 0] < self.x_range[1]) &
+                (pts[:, 1] >= self.y_range[0]) & (pts[:, 1] < self.y_range[1]) &
+                (pts[:, 2] >= self.z_range[0]) & (pts[:, 2] < self.z_range[1])
+            )
+
+            pts_v    = pts[valid]    # (n_valid, 3)
+            feats_v  = feat[valid]   # (n_valid, C)
+
+            if len(pts_v) == 0:
+                continue
+
+            # BEV 격자 인덱스 계산
+            gx = ((pts_v[:, 0] - self.x_range[0]) / self.res).long()
+            gy = ((pts_v[:, 1] - self.y_range[0]) / self.res).long()
+
+            # 경계 처리
+            gx = gx.clamp(0, self.bev_w - 1)
+            gy = gy.clamp(0, self.bev_h - 1)
+
+            # 각 격자 셀에 특징 합산 (scatter_add)
+            flat_idx = gy * self.bev_w + gx   # (n_valid,)
+            bev_flat = bev_feat[b].view(C, -1)  # (C, H*W)
+
+            bev_flat.scatter_add_(
+                1,
+                flat_idx.unsqueeze(0).expand(C, -1),
+                feats_v.T   # (C, n_valid)
+            )
+
+        return bev_feat   # (B, C, H_bev, W_bev)
+
+
+# 테스트
+splat = SplatOperation()
+
+# 작은 더미로 테스트 (메모리 절약)
+small_pts = pts_ego[:, :10000]    # 10000개만
+small_feats = pt_feats[:, :10000]
+
+with torch.no_grad():
+    t0 = time.time()
+    bev_feat = splat(small_pts, small_feats)
+    elapsed = time.time() - t0
+
+print(f'BEV 피처맵 shape: {bev_feat.shape}')  # (1, 64, 200, 200)
+print(f'Splat 소요 시간: {elapsed*1000:.1f}ms')
+print(f'비어있지 않은 BEV 셀: {(bev_feat.abs().sum(1) > 0).sum().item():,} / {BEV_H*BEV_W:,}')
+
+# BEV 피처맵 시각화
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+bev_vis = bev_feat[0].cpu().numpy()   # (C, H, W)
+
+axes[0].imshow(bev_vis.mean(0), cmap='hot', origin='lower')
+axes[0].set_title('BEV 피처맵 (채널 평균)')
+axes[0].set_xlabel('X 격자 →')
+axes[0].set_ylabel('Y 격자 →')
+
+axes[1].imshow(bev_vis.max(0), cmap='hot', origin='lower')
+axes[1].set_title('BEV 피처맵 (채널 최댓값)')
+
+# PCA로 3채널 시각화
+C_h, C_w = bev_vis.shape[1], bev_vis.shape[2]
+bev_flat = bev_vis.reshape(64, -1).T  # (H*W, 64)
+bev_flat_norm = (bev_flat - bev_flat.mean(0)) / (bev_flat.std(0) + 1e-6)
+U, S, Vt = np.linalg.svd(bev_flat_norm, full_matrices=False)
+pca3 = (bev_flat_norm @ Vt[:3].T).reshape(C_h, C_w, 3)
+pca3 = (pca3 - pca3.min()) / (pca3.max() - pca3.min() + 1e-6)
+axes[2].imshow(pca3, origin='lower')
+axes[2].set_title('BEV 피처맵 (PCA 3채널 컬러맵)')
+
+for ax in axes:
+    ax.axvline(BEV_W//2, color='white', linestyle='--', alpha=0.5, linewidth=1)
+    ax.axhline(BEV_H//2, color='white', linestyle='--', alpha=0.5, linewidth=1)
+
+plt.suptitle(f'Splat 결과: BEV 피처맵 ({BEV_H}×{BEV_W}, {BEV_RESOLUTION}m/px)', fontsize=12)
+plt.tight_layout()
+plt.show()
+--------------------------------------------------------------------------------
+
+[CODE CELL 7]
+# Cell 8 — Shoot 단계: BEV 디코더 (세그멘테이션)
+
+class BEVDecoder(nn.Module):
+    """
+    Shoot: BEV 피처맵 → 세그멘테이션/검출
+
+    구조: U-Net 스타일 디코더
+    - 입력: (B, C, H_bev, W_bev)
+    - 출력: (B, n_classes, H_bev, W_bev) 각 셀의 클래스 예측
+
+    BEV 세그멘테이션 클래스 (nuScenes 기준):
+    - 차량 (vehicle)
+    - 차선 (road)
+    - 기타 (background)
+    """
+    def __init__(self, in_channels=64, n_classes=3):
+        super().__init__()
+        self.down1 = nn.Sequential(
+            nn.Conv2d(in_channels, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 2, stride=2, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+        )
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(256, 64, 2, stride=2, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+        )
+        self.head = nn.Conv2d(64 + in_channels, n_classes, 1)
+
+    def forward(self, bev: torch.Tensor) -> torch.Tensor:
+        """
+        bev: (B, C, H, W)
+        반환: (B, n_classes, H, W)
+        """
+        x1 = self.down1(bev)    # (B, 128, H/2, W/2)
+        x2 = self.down2(x1)     # (B, 256, H/4, W/4)
+
+        y2 = self.up2(x2)       # (B, 128, H/2, W/2)
+        y2 = torch.cat([y2, x1], dim=1)  # skip connection → (B, 256, H/2, W/2)
+
+        y1 = self.up1(y2)       # (B, 64, H, W)
+        y1 = F.interpolate(y1, size=(bev.shape[2], bev.shape[3]),
+                           mode='bilinear', align_corners=False)
+        out = torch.cat([y1, bev], dim=1)  # skip connection → (B, 64+C, H, W)
+        return self.head(out)    # (B, n_classes, H, W)
+
+
+# 디코더 테스트
+decoder = BEVDecoder(in_channels=64, n_classes=3)
+with torch.no_grad():
+    bev_seg = decoder(bev_feat)   # (1, 3, 200, 200)
+
+print(f'BEV 세그멘테이션 출력: {bev_seg.shape}')
+print(f'디코더 파라미터: {sum(p.numel() for p in decoder.parameters())/1e6:.2f}M')
+
+# 예측 시각화
+bev_pred = bev_seg[0].softmax(0).cpu().numpy()  # (3, H, W) 확률맵
+
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+class_names = ['차량', '도로', '배경']
+colors_map = ['Reds', 'Blues', 'Greens']
+
+for i in range(3):
+    axes[i].imshow(bev_pred[i], cmap=colors_map[i], vmin=0, vmax=1, origin='lower')
+    axes[i].set_title(f'{class_names[i]} 확률맵')
+    axes[i].axis('off')
+
+# 최종 예측 (argmax)
+pred_class = bev_pred.argmax(0)
+color_map = np.array([[255, 80, 80], [80, 80, 255], [80, 80, 80]]) / 255.0
+pred_rgb = color_map[pred_class]
+axes[3].imshow(pred_rgb, origin='lower')
+axes[3].set_title('최종 BEV 세그멘테이션\n(빨강=차량, 파랑=도로, 회색=배경)')
+axes[3].axis('off')
+
+plt.suptitle('Shoot: BEV 세그멘테이션 결과', fontsize=12)
+plt.tight_layout()
+plt.show()
+--------------------------------------------------------------------------------
+
+[CODE CELL 8]
+# Cell 9 — 전체 LSS 모델 조립
+
+class LiftSplatShoot(nn.Module):
+    """
+    Lift-Splat-Shoot 전체 모델
+
+    6개 카메라 이미지 → BEV 세그멘테이션
+
+    Lift:  이미지 → 3D 포인트 구름 (깊이 확률 × 컨텍스트)
+    Splat: 3D → BEV 격자 (scatter_add)
+    Shoot: BEV → 세그멘테이션 (U-Net 디코더)
+    """
+    def __init__(self,
+                 n_cameras: int = 6,
+                 feat_channels: int = 64,
+                 ctx_channels: int = 64,
+                 n_depths: int = N_DEPTHS,
+                 n_classes: int = 3):
+        super().__init__()
+        self.n_cams = n_cameras
+        self.ctx_ch = ctx_channels
+
+        # Lift 네트워크 (모든 카메라 공유)
+        self.depth_net = DepthPredictionNet(
+            in_channels=3,
+            feat_channels=feat_channels,
+            n_depths=n_depths,
+            ctx_channels=ctx_channels
+        )
+        self.lift = LiftOperation(depths=DEPTH_BINS)
+
+        # Splat
+        self.splat = SplatOperation()
+
+        # Shoot
+        self.decoder = BEVDecoder(in_channels=ctx_channels, n_classes=n_classes)
+
+    def forward(self,
+                imgs: torch.Tensor,
+                Ks: torch.Tensor,
+                T_cam2egos: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            imgs:        (B, N_cam, 3, H, W)
+            Ks:          (B, N_cam, 3, 3)
+            T_cam2egos:  (B, N_cam, 4, 4)
+
+        Returns:
+            bev_logits: (B, n_classes, H_bev, W_bev)
+        """
+        B, N, C, H, W = imgs.shape
+
+        # 1. Lift: 모든 카메라 이미지 처리 (배치 차원으로 합쳐서 효율화)
+        imgs_flat = imgs.view(B * N, C, H, W)               # (B*N, 3, H, W)
+        depth_prob, ctx = self.depth_net(imgs_flat)          # (B*N, D, h, w), (B*N, C, h, w)
+
+        depth_prob = depth_prob.view(B, N, *depth_prob.shape[1:])
+        ctx        = ctx.view(B, N, *ctx.shape[1:])
+
+        # 2. 각 카메라별 3D 포인트 생성
+        all_pts, all_feats = [], []
+        for cam_idx in range(N):
+            pts, feats = self.lift(
+                depth_prob[:, cam_idx],    # (B, D, h, w)
+                ctx[:, cam_idx],           # (B, C, h, w)
+                Ks[:, cam_idx],            # (B, 3, 3)
+                T_cam2egos[:, cam_idx]     # (B, 4, 4)
+            )
+            all_pts.append(pts)     # (B, D*h*w, 3)
+            all_feats.append(feats) # (B, D*h*w, ctx_ch)
+
+        # 모든 카메라 합산
+        all_pts   = torch.cat(all_pts,   dim=1)  # (B, N*D*h*w, 3)
+        all_feats = torch.cat(all_feats, dim=1)  # (B, N*D*h*w, ctx_ch)
+
+        # 3. Splat: 3D → BEV
+        bev_feat = self.splat(all_pts, all_feats)   # (B, ctx_ch, H_bev, W_bev)
+
+        # 4. Shoot: BEV → 세그멘테이션
+        bev_logits = self.decoder(bev_feat)         # (B, n_classes, H_bev, W_bev)
+
+        return bev_logits
+
+
+# 전체 모델 테스트 (작은 이미지로)
+model = LiftSplatShoot(n_cameras=6, feat_channels=32, ctx_channels=32, n_classes=3)
+
+# 더미 입력 (작은 해상도로 메모리 절약)
+test_h, test_w = 128, 224
+dummy_imgs = torch.randn(1, 6, 3, test_h, test_w)
+dummy_Ks = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, 6, -1, -1).contiguous()
+dummy_Ks[:, :, 0, 0] = 500.0   # fx
+dummy_Ks[:, :, 1, 1] = 500.0   # fy
+dummy_Ks[:, :, 0, 2] = test_w / 2  # cx
+dummy_Ks[:, :, 1, 2] = test_h / 2  # cy
+dummy_T = torch.eye(4).unsqueeze(0).unsqueeze(0).expand(1, 6, -1, -1).contiguous()
+
+model.eval()
+with torch.no_grad():
+    t0 = time.time()
+    bev_out = model(dummy_imgs, dummy_Ks, dummy_T)
+    elapsed = time.time() - t0
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f'전체 파라미터: {total_params/1e6:.2f}M')
+print(f'추론 시간 (6카메라): {elapsed*1000:.0f}ms')
+print(f'BEV 출력 shape: {bev_out.shape}')  # (1, 3, 200, 200)
+--------------------------------------------------------------------------------
+
+[CODE CELL 9]
+# Cell 10 — BEV IoU 평가 지표 + 미니 학습 루프
+
+def bev_iou(pred: torch.Tensor, target: torch.Tensor,
+            n_classes: int = 3) -> Dict[str, float]:
+    """
+    BEV 세그멘테이션 IoU 계산
+
+    pred:   (B, n_classes, H, W) logits
+    target: (B, H, W) 클래스 인덱스
+    """
+    pred_cls = pred.argmax(dim=1)  # (B, H, W)
+    class_names = ['차량', '도로', '배경']
+    result = {}
+
+    for cls_idx in range(n_classes):
+        pred_mask = (pred_cls == cls_idx)
+        gt_mask   = (target == cls_idx)
+
+        intersection = (pred_mask & gt_mask).sum().float()
+        union        = (pred_mask | gt_mask).sum().float()
+        iou = (intersection / (union + 1e-6)).item()
+        result[class_names[cls_idx]] = iou
+
+    result['mIoU'] = np.mean(list(result.values()))
+    return result
+
+
+class SimpleBEVDataset(Dataset):
+    """합성 BEV 세그멘테이션 데이터셋 (학습 루프 테스트용)"""
+    def __init__(self, n_samples=30, img_h=64, img_w=112):
+        self.n = n_samples
+        self.h, self.w = img_h, img_w
+
+    def __len__(self): return self.n
+
+    def __getitem__(self, idx):
+        np.random.seed(idx)
+        # 합성 이미지 6개
+        imgs = torch.rand(6, 3, self.h, self.w)
+
+        # 카메라 파라미터 (균등 배치)
+        Ks = torch.eye(3).unsqueeze(0).expand(6, -1, -1).contiguous().float()
+        Ks[:, 0, 0] = Ks[:, 1, 1] = 200.0
+        Ks[:, 0, 2] = self.w / 2
+        Ks[:, 1, 2] = self.h / 2
+
+        angles = torch.linspace(0, 2*np.pi, 7)[:6]
+        T = torch.eye(4).unsqueeze(0).expand(6, -1, -1).contiguous().float()
+
+        # 합성 BEV GT (3클래스 세그멘테이션)
+        bev_gt = torch.randint(0, 3, (BEV_H, BEV_W))
+        # 도로는 중앙 영역에 집중
+        bev_gt[BEV_H//3:2*BEV_H//3, BEV_W//3:2*BEV_W//3] = 1
+
+        return imgs, Ks, T, bev_gt
+
+
+# 미니 학습
+train_ds = SimpleBEVDataset(n_samples=20)
+train_dl = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=0)
+
+model = LiftSplatShoot(n_cameras=6, feat_channels=32, ctx_channels=32, n_classes=3).to(DEVICE)
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+criterion = nn.CrossEntropyLoss()
+
+N_EPOCHS = 3
+history = {'loss': [], 'mIoU': []}
+print(f'학습 시작 (device: {DEVICE})')
+
+for epoch in range(N_EPOCHS):
+    model.train()
+    epoch_loss, epoch_miou = 0.0, 0.0
+    t0 = time.time()
+
+    for imgs, Ks, T, bev_gt in train_dl:
+        imgs   = imgs.to(DEVICE)
+        Ks     = Ks.to(DEVICE)
+        T      = T.to(DEVICE)
+        bev_gt = bev_gt.to(DEVICE)
+
+        bev_pred = model(imgs, Ks, T)   # (1, 3, 200, 200)
+        loss = criterion(bev_pred, bev_gt.unsqueeze(0))
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        optimizer.step()
+
+        iou_dict = bev_iou(bev_pred.detach(), bev_gt.unsqueeze(0))
+        epoch_loss += loss.item()
+        epoch_miou += iou_dict['mIoU']
+
+    avg_loss = epoch_loss / len(train_dl)
+    avg_miou = epoch_miou / len(train_dl)
+    history['loss'].append(avg_loss)
+    history['mIoU'].append(avg_miou)
+    print(f'Epoch [{epoch+1}/{N_EPOCHS}] Loss: {avg_loss:.4f}, '
+          f'mIoU: {avg_miou:.4f} [{time.time()-t0:.1f}s]')
+
+# 학습 곡선
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+ax1.plot(history['loss'], 'r-o', linewidth=2)
+ax1.set_title('학습 손실')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Cross Entropy Loss')
+ax1.grid(alpha=0.3)
+
+ax2.plot(history['mIoU'], 'b-o', linewidth=2)
+ax2.set_title('BEV mIoU')
+ax2.set_xlabel('Epoch')
+ax2.set_ylabel('mIoU')
+ax2.grid(alpha=0.3)
+
+plt.suptitle('LSS 학습 결과', fontsize=12)
+plt.tight_layout()
+plt.show()
+--------------------------------------------------------------------------------
+
+[CODE CELL 10]
+# Cell 11 — Lift 단계 시각화: 깊이 분포 + 3D 포인트 구름
+
+model.eval()
+imgs_vis, Ks_vis, T_vis, gt_vis = next(iter(train_dl))
+imgs_vis = imgs_vis.to(DEVICE)
+
+with torch.no_grad():
+    # 첫 번째 카메라의 깊이 분포 시각화
+    one_cam_img = imgs_vis[0, 0:1]   # (1, 3, H, W) — 앞 카메라
+    depth_prob_vis, ctx_vis = model.depth_net(one_cam_img)
+
+fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+
+# 원본 이미지
+img_np = one_cam_img[0].permute(1, 2, 0).cpu().numpy()
+img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+axes[0, 0].imshow(img_np)
+axes[0, 0].set_title('입력 이미지 (앞 카메라)')
+axes[0, 0].axis('off')
+
+# 깊이 분포 (특정 픽셀의 깊이 히스토그램)
+h_mid = depth_prob_vis.shape[2] // 2
+w_mid = depth_prob_vis.shape[3] // 2
+depth_dist = depth_prob_vis[0, :, h_mid, w_mid].cpu().numpy()
+axes[0, 1].bar(DEPTH_BINS[:len(depth_dist)], depth_dist, width=0.8, color='steelblue')
+axes[0, 1].set_title(f'중앙 픽셀 깊이 분포\n(D={N_DEPTHS}빈, {D_MIN}~{D_MAX}m)')
+axes[0, 1].set_xlabel('깊이 (m)')
+axes[0, 1].set_ylabel('확률')
+axes[0, 1].grid(alpha=0.3)
+
+# 특정 깊이에서의 확률 맵
+for i, d_idx in enumerate([0, 10, 20, 30]):
+    ax = axes[0, 2+i] if i < 2 else axes[1, i-2]
+    depth_map = depth_prob_vis[0, d_idx].cpu().numpy()
+    im = ax.imshow(depth_map, cmap='hot')
+    plt.colorbar(im, ax=ax)
+    ax.set_title(f'깊이={DEPTH_BINS[min(d_idx, len(DEPTH_BINS)-1)]:.0f}m 확률맵')
+    ax.axis('off')
+
+# 컨텍스트 특징 (채널 평균)
+ctx_mean = ctx_vis[0].abs().mean(0).cpu().numpy()
+axes[1, 2].imshow(ctx_mean, cmap='viridis')
+axes[1, 2].set_title('컨텍스트 특징 (채널 평균)')
+axes[1, 2].axis('off')
+
+# BEV 결과
+with torch.no_grad():
+    Ks_dev = Ks_vis.to(DEVICE)
+    T_dev  = T_vis.to(DEVICE)
+    bev_result = model(imgs_vis, Ks_dev, T_dev)
+
+bev_pred_cls = bev_result[0].argmax(0).cpu().numpy()
+color_map_np = np.array([[255, 80, 80], [80, 80, 255], [80, 80, 80]]) / 255.0
+bev_rgb = color_map_np[bev_pred_cls]
+axes[1, 3].imshow(bev_rgb, origin='lower')
+axes[1, 3].set_title('최종 BEV 세그멘테이션')
+axes[1, 3].axis('off')
+
+# 범례
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor=[1,0.3,0.3], label='차량'),
+    Patch(facecolor=[0.3,0.3,1], label='도로'),
+    Patch(facecolor=[0.3,0.3,0.3], label='배경')
+]
+axes[1, 3].legend(handles=legend_elements, loc='lower right', fontsize=8)
+
+plt.suptitle('LSS Lift-Splat-Shoot 전체 파이프라인 시각화', fontsize=12, fontweight='bold')
+plt.tight_layout()
+plt.show()
+--------------------------------------------------------------------------------
+
+[CODE CELL 11]
+# Cell 12 — 모델 요약 및 성능 비교
+
+print('=' * 65)
+print('Lift-Splat-Shoot 모델 요약')
+print('=' * 65)
+
+def count_module_params(m, name):
+    n = sum(p.numel() for p in m.parameters())
+    print(f'  {name:<35}: {n/1e6:>6.2f}M params')
+    return n
+
+total = 0
+total += count_module_params(model.depth_net, 'Depth Net (Lift - 공유 백본)')
+total += count_module_params(model.decoder,   'BEV Decoder (Shoot)')
+print(f'  {"합계":<35}: {total/1e6:>6.2f}M params')
+print()
+
+print('처리 흐름 (입출력 크기)')
+print(f'  입력: 6 × (3, {ORIG_H}, {ORIG_W}) 이미지')
+print(f'  백본 후: 6 × (64, H/8, W/8)')
+print(f'  Lift 후: 6 × (D×H/8×W/8, 3+64) 포인트 구름')
+print(f'  Splat 후: (64, {BEV_H}, {BEV_W}) BEV 피처맵')
+print(f'  Shoot 출력: (n_classes, {BEV_H}, {BEV_W})')
+print()
+
+# 추론 속도
+print('추론 속도 측정...')
+test_imgs  = torch.randn(1, 6, 3, 64, 112).to(DEVICE)
+test_Ks    = dummy_Ks.to(DEVICE)
+test_T     = dummy_T.to(DEVICE)
+
+model.eval()
+times = []
+with torch.no_grad():
+    for _ in range(8):
+        t0 = time.time()
+        _ = model(test_imgs, test_Ks, test_T)
+        if DEVICE.type == 'cuda':
+            torch.cuda.synchronize()
+        times.append(time.time() - t0)
+
+avg_ms = np.mean(times[2:]) * 1000
+print(f'  평균 추론 시간 (6카메라): {avg_ms:.0f}ms ({1000/avg_ms:.0f} FPS)')
+print()
+
+print('논문 nuScenes 벤치마크 (BEV 세그멘테이션)')
+print('  차량 IoU:  36.0%')
+print('  도로 IoU:  77.2%')
+print('  mIoU:     56.6%')
+print()
+
+print('후속 연구 영향 (LSS 아키텍처 계승)')
+print('  BEVDet (2022)     — LSS 인코더 + CenterPoint 헤드')
+print('  BEVDepth (2022)   — 깊이 supervision 강화')
+print('  BEVFusion (2022)  — LiDAR + Camera BEV 융합')
+print('  Tesla Autopilot   — 유사 아키텍처 (추정)')
+--------------------------------------------------------------------------------

@@ -1,0 +1,10 @@
+names:
+  0: car
+  1: pedestrian
+  2: cyclist
+nc: 3
+path: C:\Users\apple\Desktop\autonomous_cv_pipeline\skillup_round4\synthetic_to_real
+train:
+- C:\Users\apple\Desktop\autonomous_cv_pipeline\phase4_carla\data_collection\carla_dataset\images
+- C:\Users\apple\Desktop\autonomous_cv_pipeline\skillup_round4\synthetic_to_real\pseudo_dataset\images
+val: C:\Users\apple\Desktop\autonomous_cv_pipeline\phase4_carla\data_collection\carla_dataset\images

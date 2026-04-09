@@ -1,0 +1,143 @@
+# 실행: docker compose up --build
+# 프론트엔드: http://localhost:3000
+# Gateway API: http://localhost:8000
+# Swagger UI: http://localhost:8000/docs
+
+services:
+
+  # ── Detection (YOLOv8 CARLA finetuned) ─────────────────
+  detection:
+    build: ./services/detection
+    ports:
+      - "8001:8001"
+    volumes:
+      # CARLA finetuned YOLO 가중치
+      - ../phase4_carla/finetuning/runs/carla_finetune/weights/best.pt:/models/best.pt:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── Depth (DepthAnythingV2 Metric-Outdoor) ──────────────
+  depth:
+    build: ./services/depth
+    ports:
+      - "8002:8002"
+    environment:
+      - TRANSFORMERS_CACHE=/hf_cache
+    volumes:
+      - hf_cache:/hf_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # ── Segmentation (SegFormer ADE20K) ────────────────────
+  segmentation:
+    build: ./services/segmentation
+    ports:
+      - "8003:8003"
+    environment:
+      - TRANSFORMERS_CACHE=/hf_cache
+    volumes:
+      - hf_cache:/hf_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # ── VLM (Qwen2-VL-2B QLoRA) ────────────────────────────
+  vlm:
+    build: ./services/vlm
+    ports:
+      - "8004:8004"
+    environment:
+      - TRANSFORMERS_CACHE=/hf_cache
+    volumes:
+      # LoRA 어댑터 (파인튜닝 가중치)
+      - ../vlm_driving/lora_adapter:/lora_adapter:ro
+      - hf_cache:/hf_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s  # VLM 모델 로드는 시간이 걸림
+
+  # ── Gateway ────────────────────────────────────────────
+  gateway:
+    build: ./services/gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - DETECTION_URL=http://detection:8001
+      - DEPTH_URL=http://depth:8002
+      - SEGMENTATION_URL=http://segmentation:8003
+      - VLM_URL=http://vlm:8004
+      - SAMPLE_DIR=/carla_samples
+    volumes:
+      # CARLA 샘플 이미지
+      - ../phase4_carla/data_collection/carla_dataset/images:/carla_samples:ro
+    depends_on:
+      detection:
+        condition: service_healthy
+      depth:
+        condition: service_healthy
+      segmentation:
+        condition: service_healthy
+      vlm:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Frontend (React + Vite → nginx) ────────────────────
+  frontend:
+    build: ./frontend
+    ports:
+      - "3100:80"
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+# ── 공유 볼륨 ──────────────────────────────────────────────
+volumes:
+  hf_cache:
+    driver: local
+    # HuggingFace 모델 캐시 공유 (depth + segmentation + vlm 이 같은 캐시 사용)

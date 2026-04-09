@@ -1,0 +1,1105 @@
+File written successfully
+=====================================================
+FILE 1: 02_kitti_3d_detection.ipynb
+================================================================================
+
+
+[CODE CELL 1]
+# Cell 1 — 한글 폰트 설정 + 전체 임포트
+import matplotlib
+matplotlib.rcParams['font.family'] = 'Malgun Gothic'
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+import os, sys, struct, time
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+print(f'PyTorch: {torch.__version__}')
+print(f'CUDA 사용 가능: {torch.cuda.is_available()}')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'사용 디바이스: {DEVICE}')
+--------------------------------------------------------------------------------
+
+[CODE CELL 2]
+# Cell 3 — KITTI 데이터셋 로딩
+# 데이터 경로 설정 (없으면 합성 데이터로 대체)
+
+KITTI_ROOT = Path('data/kitti')   # KITTI 오브젝트 검출 데이터셋 루트
+
+def load_kitti_velodyne(bin_path: str) -> np.ndarray:
+    """KITTI velodyne .bin 파일 로드 → (N, 4) 배열 [x, y, z, intensity]"""
+    points = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 4)
+    return points
+
+@dataclass
+class KITTIObject:
+    cls_name: str    # 'Car', 'Pedestrian', 'Cyclist'
+    x: float         # 3D 박스 중심 x (카메라 좌표)
+    y: float         # 3D 박스 중심 y
+    z: float         # 3D 박스 중심 z
+    h: float         # 높이
+    w: float         # 너비
+    l: float         # 길이
+    ry: float        # y축 회전각 (yaw)
+
+def load_kitti_labels(label_path: str) -> List[KITTIObject]:
+    """KITTI label .txt 파일 로드"""
+    objects = []
+    with open(label_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if parts[0] in ('Car', 'Pedestrian', 'Cyclist'):
+                objects.append(KITTIObject(
+                    cls_name=parts[0],
+                    h=float(parts[8]), w=float(parts[9]), l=float(parts[10]),
+                    x=float(parts[11]), y=float(parts[12]), z=float(parts[13]),
+                    ry=float(parts[14])
+                ))
+    return objects
+
+def camera_to_lidar(obj: KITTIObject, calib: dict) -> np.ndarray:
+    """카메라 좌표계 → LiDAR 좌표계 변환 (캘리브레이션 행렬 사용)"""
+    # 간소화: Tr_velo_to_cam의 역변환
+    Tr = calib.get('Tr_velo_to_cam', np.eye(4))
+    Tr_inv = np.linalg.inv(Tr)
+    pt_cam = np.array([obj.x, obj.y, obj.z, 1.0])
+    pt_lidar = Tr_inv @ pt_cam
+    return pt_lidar[:3]
+
+# 합성 데이터 생성 (KITTI 없을 때 사용)
+def generate_synthetic_pointcloud(n_points=15000, n_objects=3) -> Tuple[np.ndarray, list]:
+    """합성 포인트클라우드 + GT 박스 생성 (KITTI 다운로드 없이 테스트용)"""
+    np.random.seed(42)
+    # 배경 포인트: 지면 + 랜덤 노이즈
+    ground = np.random.uniform(low=[-40,-40,0], high=[40,40,0.1], size=(n_points//2, 4))
+    ground[:,3] = np.random.uniform(0, 0.3, n_points//2)  # intensity
+    random_pts = np.random.uniform(low=[-40,-40,0], high=[40,40,3], size=(n_points//4, 4))
+    random_pts[:,3] = np.random.uniform(0, 0.5, n_points//4)
+
+    # 전방 LiDAR 반사 패턴
+    dist = np.random.exponential(scale=20, size=n_points//4)
+    angle = np.random.uniform(-np.pi/3, np.pi/3, n_points//4)
+    fwd = np.zeros((n_points//4, 4))
+    fwd[:,0] = dist * np.cos(angle)
+    fwd[:,1] = dist * np.sin(angle)
+    fwd[:,2] = np.random.uniform(-0.5, 2.5, n_points//4)
+    fwd[:,3] = np.random.uniform(0.1, 1.0, n_points//4)
+    
+    points = np.vstack([ground, random_pts, fwd]).astype(np.float32)
+
+    # 객체 박스 생성 + 해당 영역 포인트 밀도 높이기
+    boxes = []
+    car_centers = [(10, 2, 0.9), (15, -3, 0.9), (8, -8, 0.9)]
+    for i, (cx, cy, cz) in enumerate(car_centers[:n_objects]):
+        # 박스 주변에 포인트 300개 추가
+        obj_pts = np.random.uniform(
+            low=[cx-2, cy-0.9, cz-0.8],
+            high=[cx+2, cy+0.9, cz+0.8],
+            size=(300, 4)
+        ).astype(np.float32)
+        obj_pts[:,3] = np.random.uniform(0.5, 1.0, 300)
+        points = np.vstack([points, obj_pts])
+        # [x, y, z, l, w, h, yaw]
+        boxes.append([cx, cy, cz, 4.0, 1.8, 1.6, 0.0])
+
+    return points, boxes
+
+# 데이터 로드 테스트
+if KITTI_ROOT.exists():
+    print('KITTI 데이터셋 발견!')
+    velodyne_dir = KITTI_ROOT / 'training' / 'velodyne'
+    sample_files = sorted(velodyne_dir.glob('*.bin'))[:3]
+    points, _ = load_kitti_velodyne(str(sample_files[0])), None
+    USE_KITTI = True
+else:
+    print('KITTI 없음 → 합성 데이터 사용')
+    print('KITTI 다운로드: https://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d')
+    points, gt_boxes = generate_synthetic_pointcloud(n_points=20000, n_objects=3)
+    USE_KITTI = False
+
+print(f'포인트클라우드 shape: {points.shape}')  # (N, 4)
+print(f'x 범위: [{points[:,0].min():.1f}, {points[:,0].max():.1f}]')
+print(f'y 범위: [{points[:,1].min():.1f}, {points[:,1].max():.1f}]')
+print(f'z 범위: [{points[:,2].min():.1f}, {points[:,2].max():.1f}]')
+print(f'intensity 범위: [{points[:,3].min():.3f}, {points[:,3].max():.3f}]')
+--------------------------------------------------------------------------------
+
+[CODE CELL 3]
+# Cell 4 — BEV (Bird's Eye View) 포인트클라우드 시각화
+
+def visualize_bev(points: np.ndarray, boxes=None, title='BEV 포인트클라우드',
+                  x_range=(-40, 40), y_range=(-40, 40)):
+    """Bird's Eye View 시각화"""
+    mask = (
+        (points[:,0] >= x_range[0]) & (points[:,0] <= x_range[1]) &
+        (points[:,1] >= y_range[0]) & (points[:,1] <= y_range[1])
+    )
+    pts = points[mask]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # BEV 산점도
+    ax = axes[0]
+    scatter = ax.scatter(pts[:,0], pts[:,1], c=pts[:,2], s=0.3,
+                         cmap='RdYlGn', vmin=-2, vmax=3, alpha=0.6)
+    plt.colorbar(scatter, ax=ax, label='높이 (m)')
+    if boxes is not None:
+        for box in boxes:
+            cx, cy, cz, l, w, h, yaw = box
+            rect = patches.Rectangle(
+                (cx - l/2, cy - w/2), l, w,
+                angle=np.degrees(yaw), linewidth=2,
+                edgecolor='red', facecolor='none'
+            )
+            ax.add_patch(rect)
+            ax.text(cx, cy, 'Car', color='red', fontsize=8, ha='center')
+    ax.set_xlim(x_range)
+    ax.set_ylim(y_range)
+    ax.set_xlabel('X (전방, m)')
+    ax.set_ylabel('Y (좌측, m)')
+    ax.set_title(f'{title} — BEV')
+    ax.set_aspect('equal')
+    ax.grid(alpha=0.3)
+    ax.plot(0, 0, 'b*', markersize=10, label='LiDAR 원점')
+    ax.legend()
+
+    # 높이 분포
+    ax2 = axes[1]
+    ax2.hist(pts[:,2], bins=60, color='steelblue', edgecolor='navy', alpha=0.7)
+    ax2.set_xlabel('높이 z (m)')
+    ax2.set_ylabel('포인트 수')
+    ax2.set_title('높이 분포')
+    ax2.axvline(0, color='red', linestyle='--', label='지면 (z=0)')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+
+    plt.suptitle(f'총 {len(pts):,}개 포인트', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+boxes_to_show = gt_boxes if not USE_KITTI else None
+visualize_bev(points, boxes=boxes_to_show, title='합성 포인트클라우드')
+--------------------------------------------------------------------------------
+
+[CODE CELL 4]
+# Cell 5 — Pillar 분할 및 포인트 특징 인코딩
+# 논문 Section 2.1: Pillar Feature Net
+
+# ── 설정값 (논문 기준) ──────────────────────────────
+# KITTI용 검출 범위
+POINT_CLOUD_RANGE = [0, -40, -3, 70.4, 40, 1]   # [x_min, y_min, z_min, x_max, y_max, z_max]
+VOXEL_SIZE = [0.16, 0.16, 4.0]                   # 필라 크기 (x, y, z) — z는 전체 범위
+MAX_POINTS_PER_PILLAR = 32                        # 필라당 최대 포인트 수 (논문: 100)
+MAX_PILLARS = 12000                               # 최대 필라 수 (논문: 12000)
+N_FEATURES = 9                                    # 포인트당 특징 차원 (x,y,z,r,xc,yc,zc,xp,yp)
+
+# 격자 크기 계산
+GRID_X = int((POINT_CLOUD_RANGE[3] - POINT_CLOUD_RANGE[0]) / VOXEL_SIZE[0])  # 440
+GRID_Y = int((POINT_CLOUD_RANGE[4] - POINT_CLOUD_RANGE[1]) / VOXEL_SIZE[1])  # 500
+print(f'필라 격자 크기: {GRID_X} × {GRID_Y} = {GRID_X*GRID_Y:,}개')
+print(f'필라 크기: {VOXEL_SIZE[0]}m × {VOXEL_SIZE[1]}m')
+
+def create_pillars(points: np.ndarray,
+                   point_cloud_range: list = POINT_CLOUD_RANGE,
+                   voxel_size: list = VOXEL_SIZE,
+                   max_points: int = MAX_POINTS_PER_PILLAR,
+                   max_pillars: int = MAX_PILLARS) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    포인트클라우드 → 필라 특징 텐서
+
+    반환:
+        pillars:   (max_pillars, max_points, 9) — 각 필라의 포인트 특징
+        coords:    (max_pillars, 3)             — 각 필라의 격자 좌표 (batch, y, x)
+        n_pillars: 실제 유효 필라 수
+    """
+    x_min, y_min, z_min = point_cloud_range[:3]
+    x_max, y_max, z_max = point_cloud_range[3:]
+    vx, vy, vz = voxel_size
+
+    # 1. 검출 범위 내 포인트만 필터링
+    mask = (
+        (points[:,0] >= x_min) & (points[:,0] < x_max) &
+        (points[:,1] >= y_min) & (points[:,1] < y_max) &
+        (points[:,2] >= z_min) & (points[:,2] < z_max)
+    )
+    pts = points[mask]
+
+    # 2. 각 포인트가 속하는 격자 인덱스 계산
+    ix = ((pts[:,0] - x_min) / vx).astype(np.int32)  # x 인덱스
+    iy = ((pts[:,1] - y_min) / vy).astype(np.int32)  # y 인덱스
+    
+    grid_x = int((x_max - x_min) / vx)
+    grid_y = int((y_max - y_min) / vy)
+
+    # 3. 각 격자를 고유 정수로 인코딩 (해시)
+    pillar_id = iy * grid_x + ix
+
+    # 4. 각 필라에 포인트 그룹화
+    unique_ids, inverse = np.unique(pillar_id, return_inverse=True)
+    n_pillars = min(len(unique_ids), max_pillars)
+
+    pillars = np.zeros((max_pillars, max_points, N_FEATURES), dtype=np.float32)
+    coords = np.zeros((max_pillars, 3), dtype=np.int32)  # (batch=0, y, x)
+
+    for pid in range(n_pillars):
+        uid = unique_ids[pid]
+        pt_indices = np.where(inverse == pid)[0]
+
+        # 포인트 수 제한
+        if len(pt_indices) > max_points:
+            pt_indices = np.random.choice(pt_indices, max_points, replace=False)
+
+        n_pts = len(pt_indices)
+        selected = pts[pt_indices]  # (n_pts, 4): x, y, z, r
+
+        # 필라 내 포인트들의 중심 계산
+        xc, yc, zc = selected[:,0].mean(), selected[:,1].mean(), selected[:,2].mean()
+
+        # 격자 중심 좌표 (필라의 지면 중심점)
+        gy = uid // grid_x
+        gx = uid % grid_x
+        xp = x_min + (gx + 0.5) * vx
+        yp = y_min + (gy + 0.5) * vy
+
+        # 9차원 특징 벡터 구성: [x, y, z, r, x-xc, y-yc, z-zc, x-xp, y-yp]
+        feat = np.zeros((n_pts, N_FEATURES), dtype=np.float32)
+        feat[:, 0] = selected[:, 0]          # x
+        feat[:, 1] = selected[:, 1]          # y
+        feat[:, 2] = selected[:, 2]          # z
+        feat[:, 3] = selected[:, 3]          # r (intensity)
+        feat[:, 4] = selected[:, 0] - xc     # x - 필라중심x
+        feat[:, 5] = selected[:, 1] - yc     # y - 필라중심y
+        feat[:, 6] = selected[:, 2] - zc     # z - 필라중심z
+        feat[:, 7] = selected[:, 0] - xp     # x - 격자중심x
+        feat[:, 8] = selected[:, 1] - yp     # y - 격자중심y
+
+        pillars[pid, :n_pts] = feat
+        coords[pid] = [0, gy, gx]
+
+    return pillars, coords, n_pillars
+
+
+# 테스트
+print('필라 생성 중...')
+t0 = time.time()
+pillars_np, coords_np, n_valid = create_pillars(points)
+print(f'소요 시간: {time.time()-t0:.2f}s')
+print(f'유효 필라 수: {n_valid:,} / {MAX_PILLARS:,}')
+print(f'필라 텐서 shape: {pillars_np.shape}')   # (12000, 32, 9)
+print(f'좌표 텐서 shape: {coords_np.shape}')    # (12000, 3)
+print(f'\n예시 필라 (index=0):')
+print(f'  격자 좌표: y={coords_np[0,1]}, x={coords_np[0,2]}')
+print(f'  포인트[0]: {pillars_np[0,0]}')         # [x, y, z, r, xc, yc, zc, xp, yp]
+--------------------------------------------------------------------------------
+
+[CODE CELL 5]
+# Cell 6 — Pillar Feature Net (PFN) 구현
+# 논문 Figure 2 (a): 각 필라에 Linear → BN → ReLU → MaxPool 적용
+
+class PillarFeatureNet(nn.Module):
+    """
+    PointPillars 논문의 Pillar Feature Net
+
+    입력: (batch, max_pillars, max_points, 9)
+    출력: (batch, C_out, max_pillars)  — 각 필라당 하나의 특징 벡터
+    """
+    def __init__(self, in_channels=9, out_channels=64):
+        super().__init__()
+        # Linear + BN + ReLU (포인트별 적용 → 1D Conv로 구현)
+        # 입력 shape: (N, 9, P) where N=필라수, P=포인트수
+        self.conv1 = nn.Linear(in_channels, out_channels, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+
+    def forward(self, pillars: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pillars: (B, P_max, N_max, 9)  — B=배치, P=필라수, N=포인트수, 9=특징
+            mask:    (B, P_max, N_max)     — 유효 포인트 마스크 (padding=0)
+        Returns:
+            (B, P_max, C_out)
+        """
+        B, P, N, C = pillars.shape
+
+        # 배치+필라+포인트를 하나로 합쳐서 Linear 적용
+        x = pillars.view(B * P * N, C)      # (B*P*N, 9)
+        x = self.conv1(x)                   # (B*P*N, C_out)
+
+        # BatchNorm: 1D BN은 (N, C, L) 기대 → (B*P*N, C_out) 그대로 사용
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = x.view(B, P, N, -1)            # (B, P, N, C_out)
+
+        # 패딩 포인트 마스킹 (0 채움)
+        mask = mask.unsqueeze(-1).float()   # (B, P, N, 1)
+        x = x * mask
+
+        # MaxPool: 각 필라 내 포인트들 중 최댓값 → (B, P, C_out)
+        x = x.max(dim=2)[0]               # (B, P, C_out)
+        return x
+
+
+class PseudoImageScatter(nn.Module):
+    """
+    PointPillars 논문의 Scatter 연산
+    필라 특징 (B, P, C) → 2D pseudo-image (B, C, H, W)
+    각 필라를 격자 좌표에 배치하는 역 인덱싱 연산
+    """
+    def __init__(self, out_channels=64, grid_h=500, grid_w=440):
+        super().__init__()
+        self.C = out_channels
+        self.H = grid_h
+        self.W = grid_w
+
+    def forward(self, pillar_features: torch.Tensor,
+                coords: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """
+        Args:
+            pillar_features: (B, P_max, C)
+            coords:          (B, P_max, 3)  — (batch_idx, gy, gx)
+        Returns:
+            canvas: (B, C, H, W)
+        """
+        B = batch_size
+        canvas = torch.zeros(B, self.C, self.H, self.W,
+                             device=pillar_features.device, dtype=pillar_features.dtype)
+
+        for b in range(B):
+            feats = pillar_features[b]   # (P_max, C)
+            c = coords[b]               # (P_max, 3)
+
+            # 유효 필라만 선택 (좌표가 0이 아닌 것)
+            valid_mask = (c[:, 1] > 0) | (c[:, 2] > 0)
+            valid_feats = feats[valid_mask]      # (n_valid, C)
+            valid_coords = c[valid_mask]         # (n_valid, 3)
+
+            gy = valid_coords[:, 1].clamp(0, self.H - 1)
+            gx = valid_coords[:, 2].clamp(0, self.W - 1)
+
+            # 캔버스에 필라 특징 배치
+            canvas[b, :, gy, gx] = valid_feats.T   # (C, n_valid)
+
+        return canvas
+
+
+# 테스트
+pfn = PillarFeatureNet(in_channels=9, out_channels=64)
+scatter = PseudoImageScatter(out_channels=64, grid_h=GRID_Y, grid_w=GRID_X)
+
+# 더미 입력
+dummy_pillars = torch.from_numpy(pillars_np[:n_valid]).unsqueeze(0)   # (1, P, N, 9)
+dummy_coords = torch.from_numpy(coords_np[:n_valid]).unsqueeze(0)     # (1, P, 3)
+dummy_mask = (dummy_pillars.abs().sum(dim=-1) > 0).float()            # (1, P, N)
+
+print('PFN 순전파 테스트...')
+pfn.eval()
+with torch.no_grad():
+    pillar_feats = pfn(dummy_pillars, dummy_mask)   # (1, P, 64)
+    pseudo_img = scatter(pillar_feats, dummy_coords, batch_size=1)  # (1, 64, H, W)
+
+print(f'필라 특징 shape: {pillar_feats.shape}')   # (1, 12000, 64)
+print(f'Pseudo-image shape: {pseudo_img.shape}')   # (1, 64, 500, 440)
+print(f'비어있지 않은 격자 수: {(pseudo_img.abs().sum(1) > 0).sum().item():,}')
+
+# Pseudo-image 채널 평균 시각화
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+img_mean = pseudo_img[0].abs().mean(0).cpu().numpy()   # (H, W)
+img_max  = pseudo_img[0].abs().max(0)[0].cpu().numpy()
+axes[0].imshow(img_mean, cmap='hot', origin='lower')
+axes[0].set_title('Pseudo-image (채널 평균 절댓값)')
+axes[0].set_xlabel('X 격자')
+axes[0].set_ylabel('Y 격자')
+axes[1].imshow(img_max, cmap='hot', origin='lower')
+axes[1].set_title('Pseudo-image (채널 최댓값)')
+plt.suptitle(f'Pseudo-image {pseudo_img.shape[2]}×{pseudo_img.shape[3]} (각 격자=필라)', fontsize=11)
+plt.tight_layout()
+plt.show()
+print('→ 포인트클라우드가 이미지처럼 변환됨! 이제 2D CNN으로 처리 가능')
+--------------------------------------------------------------------------------
+
+[CODE CELL 6]
+# Cell 7 — 2D CNN Backbone + FPN 업샘플링
+# 논문 Figure 2 (b): Backbone Network
+
+class BackboneBlock(nn.Module):
+    """Backbone 내 기본 블록: Conv → BN → ReLU (N회 반복)"""
+    def __init__(self, in_ch, out_ch, n_layers, stride=2):
+        super().__init__()
+        layers = [
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)
+        ]
+        for _ in range(n_layers - 1):
+            layers += [
+                nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)
+            ]
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class PointPillarsBackbone(nn.Module):
+    """
+    논문 Table 1 기준 Backbone:
+    Block1: stride=2, 4레이어, out=64
+    Block2: stride=2, 6레이어, out=128
+    Block3: stride=2, 6레이어, out=256
+
+    FPN 업샘플링으로 3개 스케일 피처맵을 concatenate → (384, H/2, W/2)
+    """
+    def __init__(self, in_channels=64):
+        super().__init__()
+        # 3개 블록 (stride=2씩 다운샘플)
+        self.block1 = BackboneBlock(in_channels, 64,  n_layers=4, stride=2)
+        self.block2 = BackboneBlock(64,          128, n_layers=6, stride=2)
+        self.block3 = BackboneBlock(128,         256, n_layers=6, stride=2)
+
+        # FPN 업샘플링 (각 블록 출력을 동일 크기로)
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(64,  128, 1, stride=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True)
+        )
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 128, 2, stride=2, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True)
+        )
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, stride=4, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, 64, H, W)  — pseudo-image
+        반환: (B, 384, H/2, W/2)  — FPN concatenated feature
+        """
+        x1 = self.block1(x)   # (B, 64,  H/2,  W/2)
+        x2 = self.block2(x1)  # (B, 128, H/4,  W/4)
+        x3 = self.block3(x2)  # (B, 256, H/8,  W/8)
+
+        u1 = self.up1(x1)     # (B, 128, H/2,  W/2)
+        u2 = self.up2(x2)     # (B, 128, H/2,  W/2)
+        u3 = self.up3(x3)     # (B, 128, H/2,  W/2)
+
+        # 크기 맞춤 후 concatenate
+        target_h, target_w = u1.shape[2], u1.shape[3]
+        u2 = F.interpolate(u2, size=(target_h, target_w), mode='bilinear', align_corners=False)
+        u3 = F.interpolate(u3, size=(target_h, target_w), mode='bilinear', align_corners=False)
+
+        out = torch.cat([u1, u2, u3], dim=1)  # (B, 384, H/2, W/2)
+        return out
+
+
+# 백본 테스트
+backbone = PointPillarsBackbone(in_channels=64)
+with torch.no_grad():
+    feat_map = backbone(pseudo_img)   # (1, 64, 500, 440) 입력
+print(f'Backbone 출력: {feat_map.shape}')   # (1, 384, 250, 220)
+
+# 파라미터 수
+total_params = sum(p.numel() for p in backbone.parameters())
+print(f'Backbone 파라미터: {total_params/1e6:.2f}M')
+--------------------------------------------------------------------------------
+
+[CODE CELL 7]
+# Cell 8 — SSD 스타일 Detection Head + 앵커 생성
+# 논문 Section 2.3: Detection Head
+
+# ── 앵커 설정 (KITTI Car 기준) ─────────────────────────
+@dataclass
+class AnchorConfig:
+    width:  float   # 앵커 너비 (m)
+    length: float   # 앵커 길이 (m)
+    height: float   # 앵커 높이 (m)
+    z_center: float # 앵커 중심 z (m)
+    rotations: List[float]  # 0°, 90°
+
+CAR_ANCHOR = AnchorConfig(
+    width=1.6, length=3.9, height=1.56,
+    z_center=-1.0, rotations=[0, np.pi/2]
+)
+
+def generate_anchors(grid_h: int, grid_w: int,
+                     point_cloud_range: list = POINT_CLOUD_RANGE,
+                     voxel_size: list = VOXEL_SIZE,
+                     anchor_cfg: AnchorConfig = CAR_ANCHOR) -> np.ndarray:
+    """
+    BEV 격자 위에 앵커 생성
+    반환: (grid_h//2, grid_w//2, n_rotations, 7)
+            7 = [x, y, z, l, w, h, yaw]
+    """
+    x_min, y_min = point_cloud_range[0], point_cloud_range[1]
+    x_max, y_max = point_cloud_range[3], point_cloud_range[4]
+
+    # 앵커 중심 격자 (stride=2이므로 절반 크기)
+    stride = 2
+    anchor_stride_x = voxel_size[0] * stride
+    anchor_stride_y = voxel_size[1] * stride
+
+    x_centers = np.arange(x_min + anchor_stride_x/2, x_max, anchor_stride_x)
+    y_centers = np.arange(y_min + anchor_stride_y/2, y_max, anchor_stride_y)
+
+    # (H, W, n_rot, 7) 앵커 배열 생성
+    n_rot = len(anchor_cfg.rotations)
+    H_a, W_a = len(y_centers), len(x_centers)
+
+    anchors = np.zeros((H_a, W_a, n_rot, 7), dtype=np.float32)
+    xx, yy = np.meshgrid(x_centers, y_centers)
+
+    anchors[:, :, :, 0] = xx[:, :, np.newaxis]               # x 중심
+    anchors[:, :, :, 1] = yy[:, :, np.newaxis]               # y 중심
+    anchors[:, :, :, 2] = anchor_cfg.z_center                # z 중심
+    anchors[:, :, :, 3] = anchor_cfg.length                  # l
+    anchors[:, :, :, 4] = anchor_cfg.width                   # w
+    anchors[:, :, :, 5] = anchor_cfg.height                  # h
+    for r, rot in enumerate(anchor_cfg.rotations):
+        anchors[:, :, r, 6] = rot                            # yaw
+
+    return anchors
+
+
+class DetectionHead(nn.Module):
+    """
+    SSD 스타일 검출 헤드
+    - 분류 헤드: 각 앵커가 객체인지 확률
+    - 회귀 헤드: 앵커 대비 박스 오프셋 (7개: Δx, Δy, Δz, Δl, Δw, Δh, Δθ)
+    - 방향 헤드: 0° 또는 180° 분류
+    """
+    def __init__(self, in_channels=384, n_anchors=2, n_classes=1):
+        super().__init__()
+        self.cls_head = nn.Conv2d(in_channels, n_anchors * n_classes, 1)
+        self.reg_head = nn.Conv2d(in_channels, n_anchors * 7, 1)  # 7개 파라미터
+        self.dir_head = nn.Conv2d(in_channels, n_anchors * 2, 1)  # 2방향
+
+    def forward(self, x: torch.Tensor):
+        cls = self.cls_head(x)   # (B, 2, H, W)
+        reg = self.reg_head(x)   # (B, 14, H, W)
+        dir = self.dir_head(x)   # (B, 4, H, W)
+        return cls, reg, dir
+
+
+# 앵커 생성 + 헤드 테스트
+feat_h, feat_w = feat_map.shape[2], feat_map.shape[3]
+anchors = generate_anchors(grid_h=feat_h*2, grid_w=feat_w*2)
+print(f'앵커 shape: {anchors.shape}')    # (H/2, W/2, 2, 7)
+print(f'총 앵커 수: {anchors[...,0].size:,}')
+
+head = DetectionHead(in_channels=384, n_anchors=2)
+with torch.no_grad():
+    cls_out, reg_out, dir_out = head(feat_map)
+print(f'분류 출력: {cls_out.shape}')   # (1, 2, 250, 220)
+print(f'회귀 출력: {reg_out.shape}')   # (1, 14, 250, 220)
+print(f'방향 출력: {dir_out.shape}')   # (1, 4, 250, 220)
+--------------------------------------------------------------------------------
+
+[CODE CELL 8]
+# Cell 9 — 전체 PointPillars 모델 조립
+
+class PointPillars(nn.Module):
+    """
+    PointPillars 전체 파이프라인
+
+    LiDAR 포인트클라우드 입력 → 3D 박스 출력
+
+    파이프라인:
+        pillars (B, P, N, 9) → PFN (B, P, 64)
+        → Scatter (B, 64, H, W)
+        → Backbone (B, 384, H/2, W/2)
+        → Head → cls, reg, dir
+    """
+    def __init__(self,
+                 in_features:   int = 9,
+                 pfn_channels:  int = 64,
+                 grid_h:        int = GRID_Y,
+                 grid_w:        int = GRID_X,
+                 n_anchors:     int = 2,
+                 n_classes:     int = 1):
+        super().__init__()
+        self.pfn     = PillarFeatureNet(in_features, pfn_channels)
+        self.scatter = PseudoImageScatter(pfn_channels, grid_h, grid_w)
+        self.backbone = PointPillarsBackbone(pfn_channels)
+        self.head    = DetectionHead(384, n_anchors, n_classes)
+
+    def forward(self, pillars: torch.Tensor,
+                coords: torch.Tensor,
+                mask:   torch.Tensor,
+                batch_size: int = 1):
+        """
+        Args:
+            pillars:    (B, P, N, 9)
+            coords:     (B, P, 3)     — (batch, gy, gx)
+            mask:       (B, P, N)
+        Returns:
+            cls: (B, n_anchors, H, W)
+            reg: (B, n_anchors*7, H, W)
+            dir: (B, n_anchors*2, H, W)
+        """
+        pillar_feats = self.pfn(pillars, mask)                # (B, P, 64)
+        pseudo_img   = self.scatter(pillar_feats, coords, batch_size)  # (B, 64, H, W)
+        feat         = self.backbone(pseudo_img)              # (B, 384, H/2, W/2)
+        cls, reg, dir = self.head(feat)
+        return cls, reg, dir
+
+
+# 전체 모델 테스트
+model = PointPillars().to(DEVICE)
+
+dummy_pillars = torch.from_numpy(pillars_np[:n_valid]).unsqueeze(0).to(DEVICE)
+dummy_coords  = torch.from_numpy(coords_np[:n_valid]).unsqueeze(0).to(DEVICE)
+dummy_mask    = (dummy_pillars.abs().sum(-1) > 0).float()
+
+model.eval()
+with torch.no_grad():
+    t0 = time.time()
+    cls_out, reg_out, dir_out = model(dummy_pillars, dummy_coords, dummy_mask)
+    elapsed = time.time() - t0
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f'전체 파라미터: {total_params/1e6:.2f}M')
+print(f'추론 시간 (GPU): {elapsed*1000:.1f}ms')
+print(f'분류 출력: {cls_out.shape}')
+print(f'회귀 출력: {reg_out.shape}')
+print(f'방향 출력: {dir_out.shape}')
+--------------------------------------------------------------------------------
+
+[CODE CELL 9]
+# Cell 10 — 손실 함수: Focal Loss + Smooth L1 + Direction Loss
+# 논문 Section 2.4: Loss
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss — 어려운 예시에 집중하여 학습
+    FL(p) = -α(1-p)^γ * log(p)
+    γ=2: 쉬운 예시의 기울기를 줄임
+    α=0.25: 양성/음성 불균형 보정
+    """
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # pred: (N,) logits, target: (N,) 0/1
+        p = torch.sigmoid(pred)
+        ce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        p_t = p * target + (1 - p) * (1 - target)
+        alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
+        focal_weight = alpha_t * (1 - p_t) ** self.gamma
+        return (focal_weight * ce_loss).mean()
+
+
+def encode_box_residuals(gt_boxes: torch.Tensor,
+                         anchors: torch.Tensor) -> torch.Tensor:
+    """
+    GT 박스 → 앵커 기준 상대 오프셋 (논문 Eq. 1)
+    Δx = (x_gt - x_a) / d_a
+    Δy = (y_gt - y_a) / d_a  (d_a = sqrt(l_a^2 + w_a^2))
+    Δz = (z_gt - z_a) / h_a
+    Δl = log(l_gt / l_a)
+    Δθ = sin(θ_gt - θ_a)
+    """
+    xa, ya, za, la, wa, ha, ra = anchors.unbind(-1)
+    xg, yg, zg, lg, wg, hg, rg = gt_boxes.unbind(-1)
+
+    da = torch.sqrt(la**2 + wa**2)   # 앵커 대각선 길이
+    delta_x = (xg - xa) / da
+    delta_y = (yg - ya) / da
+    delta_z = (zg - za) / ha
+    delta_l = torch.log(lg / la)
+    delta_w = torch.log(wg / wa)
+    delta_h = torch.log(hg / ha)
+    delta_r = torch.sin(rg - ra)
+
+    return torch.stack([delta_x, delta_y, delta_z,
+                        delta_l, delta_w, delta_h, delta_r], dim=-1)
+
+
+class PointPillarsLoss(nn.Module):
+    """
+    전체 손실 = β_cls * L_cls + β_reg * L_reg + β_dir * L_dir
+    논문 기본값: β_cls=1.0, β_reg=2.0, β_dir=0.2
+    """
+    def __init__(self, cls_weight=1.0, reg_weight=2.0, dir_weight=0.2):
+        super().__init__()
+        self.focal = FocalLoss(alpha=0.25, gamma=2.0)
+        self.w_cls = cls_weight
+        self.w_reg = reg_weight
+        self.w_dir = dir_weight
+
+    def forward(self, cls_pred, reg_pred, dir_pred,
+                cls_target, reg_target, dir_target, pos_mask):
+        """
+        cls_pred:   (B, 2, H, W)
+        pos_mask:   (B, 2, H, W) — 양성 앵커 마스크
+        reg_pred/target: (B, 14, H, W)
+        """
+        # 분류 손실 (모든 앵커)
+        l_cls = self.focal(cls_pred.flatten(), cls_target.flatten())
+
+        # 회귀 손실 (양성 앵커만)
+        if pos_mask.sum() > 0:
+            # 양성 앵커 위치에서만 회귀 손실 계산
+            l_reg = F.smooth_l1_loss(
+                reg_pred.permute(0,2,3,1)[pos_mask.squeeze(1).bool()],
+                reg_target.permute(0,2,3,1)[pos_mask.squeeze(1).bool()]
+            )
+            l_dir = F.cross_entropy(
+                dir_pred.permute(0,2,3,1).reshape(-1, 2),
+                dir_target.flatten().long()
+            )
+        else:
+            l_reg = torch.tensor(0.0, device=cls_pred.device)
+            l_dir = torch.tensor(0.0, device=cls_pred.device)
+
+        total = self.w_cls * l_cls + self.w_reg * l_reg + self.w_dir * l_dir
+        return total, {'cls': l_cls.item(), 'reg': l_reg.item(), 'dir': l_dir.item()}
+
+
+# 손실 함수 동작 확인
+criterion = PointPillarsLoss()
+# 더미 타겟 생성
+cls_target = torch.zeros_like(cls_out)
+reg_target = torch.zeros_like(reg_out)
+dir_target = torch.zeros(reg_out.shape[0], 2, *reg_out.shape[2:], device=DEVICE)
+pos_mask   = torch.zeros(cls_out.shape[0], 1, *cls_out.shape[2:], device=DEVICE)
+
+loss, parts = criterion(cls_out, reg_out, dir_out, cls_target, reg_target, dir_target, pos_mask)
+print(f'손실 테스트 통과: total={loss.item():.4f}')
+print(f'  분류: {parts["cls"]:.4f}, 회귀: {parts["reg"]:.4f}, 방향: {parts["dir"]:.4f}')
+--------------------------------------------------------------------------------
+
+[CODE CELL 10]
+# Cell 11 — 3D IoU 계산 및 NMS
+# 평가 지표: 3D Bounding Box IoU
+
+def box_iou_bev(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
+    """
+    BEV (Bird's Eye View) 2D IoU 계산
+    boxes: (N, 7) — [x, y, z, l, w, h, yaw]
+
+    회전 박스 IoU를 계산 (간소화: 회전 없는 AABB 근사)
+    """
+    N, M = len(boxes1), len(boxes2)
+    ious = np.zeros((N, M), dtype=np.float32)
+
+    for i, b1 in enumerate(boxes1):
+        x1, y1, z1, l1, w1, h1, r1 = b1
+        for j, b2 in enumerate(boxes2):
+            x2, y2, z2, l2, w2, h2, r2 = b2
+
+            # BEV 교차 면적 (AABB 근사)
+            inter_x = max(0, min(x1+l1/2, x2+l2/2) - max(x1-l1/2, x2-l2/2))
+            inter_y = max(0, min(y1+w1/2, y2+w2/2) - max(y1-w1/2, y2-w2/2))
+            inter_bev = inter_x * inter_y
+
+            union_bev = l1*w1 + l2*w2 - inter_bev
+            iou_bev = inter_bev / (union_bev + 1e-6)
+
+            # 3D IoU: BEV IoU × 높이 겹침 비율
+            z1_min, z1_max = z1 - h1/2, z1 + h1/2
+            z2_min, z2_max = z2 - h2/2, z2 + h2/2
+            inter_z = max(0, min(z1_max, z2_max) - max(z1_min, z2_min))
+            union_z  = max(z1_max, z2_max) - min(z1_min, z2_min)
+            iou_z = inter_z / (union_z + 1e-6)
+
+            ious[i, j] = iou_bev * iou_z
+
+    return ious
+
+
+def nms_3d(boxes: np.ndarray, scores: np.ndarray, iou_thresh=0.5) -> np.ndarray:
+    """3D NMS (Non-Maximum Suppression)"""
+    order = scores.argsort()[::-1]
+    keep = []
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        ious = box_iou_bev(boxes[i:i+1], boxes[rest])[0]  # (len(rest),)
+        order = rest[ious < iou_thresh]
+    return np.array(keep)
+
+
+def decode_boxes(reg_pred: np.ndarray, anchors: np.ndarray) -> np.ndarray:
+    """
+    앵커 오프셋 예측값 → 절대 박스 좌표
+    encode_box_residuals의 역연산
+    """
+    xa, ya, za, la, wa, ha, ra = anchors[..., 0], anchors[..., 1], anchors[..., 2], \
+                                  anchors[..., 3], anchors[..., 4], anchors[..., 5], anchors[..., 6]
+    dx, dy, dz, dl, dw, dh, dr = reg_pred[..., 0], reg_pred[..., 1], reg_pred[..., 2], \
+                                   reg_pred[..., 3], reg_pred[..., 4], reg_pred[..., 5], reg_pred[..., 6]
+    da = np.sqrt(la**2 + wa**2)
+    x = dx * da + xa
+    y = dy * da + ya
+    z = dz * ha + za
+    l = np.exp(dl) * la
+    w = np.exp(dw) * wa
+    h = np.exp(dh) * ha
+    r = np.arcsin(dr) + ra
+    return np.stack([x, y, z, l, w, h, r], axis=-1)
+
+
+# IoU 계산 테스트
+if not USE_KITTI:
+    pred_boxes = np.array(gt_boxes, dtype=np.float32)    # GT를 예측으로 사용 (테스트용)
+    pred_boxes[:, 0] += np.random.normal(0, 0.2, len(gt_boxes))  # 약간의 오차 추가
+    scores = np.random.uniform(0.7, 0.99, len(gt_boxes))
+
+    gt_arr = np.array(gt_boxes, dtype=np.float32)
+    ious = box_iou_bev(pred_boxes, gt_arr)
+    print('3D IoU 행렬 (pred × gt):')
+    print(ious)
+
+    # NMS
+    keep = nms_3d(pred_boxes, scores, iou_thresh=0.3)
+    print(f'\nNMS 전: {len(pred_boxes)}개 → 후: {len(keep)}개')
+
+    # AP 계산 (간소화)
+    tp = (ious.max(1) >= 0.5).sum()
+    precision = tp / len(pred_boxes)
+    recall = tp / len(gt_arr)
+    print(f'Precision: {precision:.3f}, Recall: {recall:.3f}')
+--------------------------------------------------------------------------------
+
+[CODE CELL 11]
+# Cell 12 — 미니 학습 루프 (수렴 확인용)
+
+class PillarDataset(Dataset):
+    """합성 포인트클라우드 데이터셋"""
+    def __init__(self, n_samples=100):
+        self.n = n_samples
+
+    def __len__(self): return self.n
+
+    def __getitem__(self, idx):
+        np.random.seed(idx)
+        pts, boxes = generate_synthetic_pointcloud(n_points=10000, n_objects=2)
+        pillars, coords, n_valid = create_pillars(pts)
+
+        return {
+            'pillars': torch.from_numpy(pillars[:n_valid]),
+            'coords':  torch.from_numpy(coords[:n_valid]),
+            'n_valid': n_valid,
+            'gt_boxes': torch.tensor(boxes, dtype=torch.float32)
+        }
+
+def collate_fn(batch):
+    """가변 크기 필라 처리를 위한 커스텀 collate"""
+    max_p = max(b['n_valid'] for b in batch)
+    B = len(batch)
+
+    pillars = torch.zeros(B, max_p, MAX_POINTS_PER_PILLAR, N_FEATURES)
+    coords  = torch.zeros(B, max_p, 3, dtype=torch.int32)
+
+    for i, b in enumerate(batch):
+        n = b['n_valid']
+        pillars[i, :n] = b['pillars']
+        coords[i, :n]  = b['coords']
+        coords[i, :n, 0] = i  # batch index
+
+    mask = (pillars.abs().sum(-1) > 0).float()
+    gt_boxes = [b['gt_boxes'] for b in batch]
+    return pillars, coords, mask, gt_boxes
+
+
+# 학습 설정
+train_ds = PillarDataset(n_samples=50)
+train_dl = DataLoader(train_ds, batch_size=2, shuffle=True,
+                      collate_fn=collate_fn, num_workers=0)
+
+model = PointPillars().to(DEVICE)
+optimizer = torch.optim.Adam(model.parameters(), lr=2e-4, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+criterion = PointPillarsLoss()
+
+# 미니 학습 (3 epoch)
+N_EPOCHS = 3
+history = []
+print(f'학습 시작 (device: {DEVICE})')
+
+for epoch in range(N_EPOCHS):
+    model.train()
+    epoch_loss = 0.0
+    t_epoch = time.time()
+
+    for pillars, coords, mask, gt_boxes in train_dl:
+        pillars = pillars.to(DEVICE)
+        coords  = coords.to(DEVICE)
+        mask    = mask.to(DEVICE)
+
+        cls_pred, reg_pred, dir_pred = model(pillars, coords, mask, batch_size=len(pillars))
+
+        # 더미 타겟 (실제 학습에서는 앵커 매칭 필요)
+        cls_target = torch.zeros_like(cls_pred)
+        reg_target = torch.zeros_like(reg_pred)
+        dir_target = torch.zeros(cls_pred.shape[0], 2,
+                                 *cls_pred.shape[2:], device=DEVICE)
+        pos_mask = torch.zeros(cls_pred.shape[0], 1,
+                               *cls_pred.shape[2:], device=DEVICE)
+
+        loss, parts = criterion(cls_pred, reg_pred, dir_pred,
+                                cls_target, reg_target, dir_target, pos_mask)
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=35.0)
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    scheduler.step()
+    avg_loss = epoch_loss / len(train_dl)
+    history.append(avg_loss)
+    print(f'Epoch [{epoch+1}/{N_EPOCHS}] Loss: {avg_loss:.4f} '
+          f'(cls={parts["cls"]:.3f}) [{time.time()-t_epoch:.1f}s]')
+
+# 손실 곡선
+plt.figure(figsize=(6, 4))
+plt.plot(range(1, N_EPOCHS+1), history, 'b-o', linewidth=2)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('PointPillars 학습 손실 곡선')
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+--------------------------------------------------------------------------------
+
+[CODE CELL 12]
+# Cell 13 — BEV 시각화: 예측 박스 vs GT 박스
+
+def draw_box_bev(ax, box, color='red', label=None, alpha=1.0):
+    """BEV 평면에 3D 박스 그리기 (회전 적용)"""
+    x, y, z, l, w, h, yaw = box
+    cos_r, sin_r = np.cos(yaw), np.sin(yaw)
+
+    # 박스의 4 꼭지점 (박스 로컬 좌표)
+    corners_local = np.array([
+        [ l/2,  w/2],
+        [-l/2,  w/2],
+        [-l/2, -w/2],
+        [ l/2, -w/2]
+    ])
+
+    # 회전 변환
+    R = np.array([[cos_r, -sin_r], [sin_r, cos_r]])
+    corners = (R @ corners_local.T).T + np.array([x, y])
+
+    # 다각형 그리기
+    poly = plt.Polygon(corners, fill=False, edgecolor=color,
+                       linewidth=2, alpha=alpha)
+    ax.add_patch(poly)
+    ax.plot(x, y, '+', color=color, markersize=6)
+    if label:
+        ax.text(x, y+0.5, label, color=color, fontsize=8, ha='center')
+
+
+# 시각화
+if not USE_KITTI:
+    # 약간 노이즈가 있는 예측 박스 생성
+    np.random.seed(0)
+    pred_boxes_vis = np.array(gt_boxes, dtype=np.float32).copy()
+    pred_boxes_vis[:, :2] += np.random.normal(0, 0.3, (len(gt_boxes), 2))  # 위치 오차
+    pred_boxes_vis[:, 3:6] *= np.random.uniform(0.9, 1.1, (len(gt_boxes), 3))  # 크기 오차
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+
+    # 포인트클라우드 BEV
+    mask = (
+        (points[:,0] >= 0) & (points[:,0] <= 30) &
+        (points[:,1] >= -15) & (points[:,1] <= 15)
+    )
+    pts = points[mask]
+    ax.scatter(pts[:,0], pts[:,1], c=pts[:,2], s=0.5,
+               cmap='RdYlGn', vmin=-2, vmax=3, alpha=0.5)
+
+    # GT 박스 (초록)
+    for i, box in enumerate(gt_boxes):
+        draw_box_bev(ax, box, color='lime', label=f'GT {i+1}')
+
+    # 예측 박스 (빨강)
+    for i, box in enumerate(pred_boxes_vis):
+        ious_row = box_iou_bev(pred_boxes_vis[i:i+1], np.array(gt_boxes))[0]
+        best_iou = ious_row.max()
+        draw_box_bev(ax, box, color='red',
+                     label=f'Pred {i+1}\nIoU={best_iou:.2f}')
+
+    ax.set_xlim(0, 30)
+    ax.set_ylim(-15, 15)
+    ax.set_xlabel('X — 전방 (m)')
+    ax.set_ylabel('Y — 좌측 (m)')
+    ax.set_title('BEV 검출 결과: GT(초록) vs 예측(빨강)')
+    ax.set_aspect('equal')
+    ax.grid(alpha=0.3)
+
+    # LiDAR 원점 (센서 위치)
+    ax.plot(0, 0, 'b*', markersize=12, label='LiDAR 센서')
+    ax.legend(loc='upper right')
+    plt.tight_layout()
+    plt.show()
+--------------------------------------------------------------------------------
+
+[CODE CELL 13]
+# Cell 14 — 모델 아키텍처 요약 및 성능 벤치마크
+
+print('=' * 60)
+print('PointPillars 모델 요약')
+print('=' * 60)
+
+def count_params(module, name):
+    n = sum(p.numel() for p in module.parameters())
+    print(f'  {name:<30}: {n/1e6:>6.2f}M params')
+    return n
+
+total = 0
+total += count_params(model.pfn,      'Pillar Feature Net (PFN)')
+total += count_params(model.backbone, 'Backbone (3블록 + FPN)')
+total += count_params(model.head,     'Detection Head')
+print(f'  {"합계":<30}: {total/1e6:>6.2f}M params')
+print()
+
+print('입출력 텐서 크기')
+print(f'  입력 필라:    ({MAX_PILLARS}, {MAX_POINTS_PER_PILLAR}, 9)')
+print(f'  Pseudo-image: (64, {GRID_Y}, {GRID_X})')
+print(f'  Backbone 출력: (384, {GRID_Y//2}, {GRID_X//2})')
+print(f'  분류 출력:    (2, {GRID_Y//2}, {GRID_X//2})')
+print(f'  회귀 출력:    (14, {GRID_Y//2}, {GRID_X//2})')
+print()
+
+# 추론 속도 벤치마크
+print('추론 속도 측정 (10회 평균)...')
+model.eval()
+times = []
+with torch.no_grad():
+    for _ in range(10):
+        t0 = time.time()
+        _ = model(dummy_pillars, dummy_coords, dummy_mask)
+        if DEVICE.type == 'cuda':
+            torch.cuda.synchronize()
+        times.append(time.time() - t0)
+
+avg_ms = np.mean(times[2:]) * 1000  # 워밍업 2회 제외
+print(f'  평균 추론 시간: {avg_ms:.1f}ms ({1000/avg_ms:.0f} FPS)')
+print()
+
+print('논문 KITTI 벤치마크 성능 (Car class, IoU=0.7)')
+print('  Easy   AP: 79.8%')
+print('  Medium AP: 75.0%')
+print('  Hard   AP: 68.3%')
+print('  속도: ~16ms (62 FPS) on GTX 1080 Ti')
+print()
+print('VoxelNet 대비')
+print('  AP:   비슷하거나 소폭 향상')
+print('  속도: 4.2× 빠름 (3D → 2D 컨볼루션의 힘!)')
+--------------------------------------------------------------------------------

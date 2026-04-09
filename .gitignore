@@ -1,0 +1,66 @@
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── 가상환경 ───────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Jupyter ────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── 모델 가중치 (용량 초과 — 별도 공유) ──────────────────────
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.bin
+*.safetensors
+
+# ── 데이터셋 (대용량) ─────────────────────────────────────
+phase4_carla/data_collection/carla_dataset/
+phase4_carla/finetuning/carla_yolo/
+skillup_round4/synthetic_to_real/real_images/
+skillup_round4/synthetic_to_real/pseudo_dataset/
+vlm_driving/data/
+
+# ── VLM 체크포인트 (214MB) ────────────────────────────────
+vlm_driving/checkpoints/
+
+# ── 학습 결과 runs/ ───────────────────────────────────────
+runs/
+**/runs/
+
+# ── Ultralytics 캐시 ─────────────────────────────────────
+*.cache
+datasets/
+
+# ── Node / Frontend ───────────────────────────────────────
+node_modules/
+dashboard/frontend/dist/
+
+# ── OS / IDE ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ── 환경변수 (API 키 등 — 절대 커밋 금지) ──────────────────
+.env
+.env.*
+!.env.example
+
+# ── 임시 파일 ─────────────────────────────────────────────
+*.tmp
+*.log
+__cell_*.txt
+__*.txt
