@@ -64,3 +64,10 @@ Thumbs.db
 *.log
 __cell_*.txt
 __*.txt
+
+# ── 프로젝트 외 파일 ──────────────────────────────────────
+1.png
+ad
+check_dataset.py
+anaconda_projects/
+.claude/

@@ -89,6 +89,10 @@ autonomous_cv_pipeline/
 │   ├── lane_detection/         # UFLD Row-anchor 분류 직접 구현 + TuSimple 메트릭
 │   ├── 3d_tracking/            # AB3DMOT 3D Kalman Filter + BEV 회전 IoU + MOTA/MOTP
 │   └── multitask_learning/     # ResNet+FPN 단일 backbone → Det+Depth+Seg + GradNorm
+├── skillup_round7/
+│   ├── stereo_depth/           # PSMNet-lite 4D Cost Volume + Block Matching 비교
+│   ├── panoptic_seg/           # PanopticFPN + PQ 평가 파이프라인
+│   └── detr/                   # DETR Hungarian Matching + GIoU + Object Query
 └── dashboard/
     ├── docker-compose.yml  # 마이크로서비스 통합 (5 서비스 + frontend)
     └── frontend/           # React + Vite + TypeScript
