@@ -71,3 +71,10 @@ ad
 check_dataset.py
 anaconda_projects/
 .claude/
+
+# ── AI 어시스턴트 / IDE 내부 파일 ─────────────────────────
+CLAUDE.md
+.vscode/
+INTERVIEW_PREP.md
+JD_APPLICATION.md
+RESUME_BULLETS.md
